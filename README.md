@@ -60,7 +60,7 @@ polypharmacy/
 consort_diagram_r.Rmd
 progress_oct6.Rmd
 HIVDrugAbbrev.xlsx
-images/
+images/                     # ignored; local/restricted outputs only
 Outputs/                   # ignored; local/restricted outputs only
 ```
 
