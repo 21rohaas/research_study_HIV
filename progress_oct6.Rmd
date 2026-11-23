@@ -1,0 +1,2284 @@
+---
+title: "transofmations"
+output: pdf_document
+date: "2026-10-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Packages 
+
+```{r packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(stats)
+library(splines)
+library(broom)
+library(gtsummary)
+library(MatchIt)
+library(cobalt)
+library(DBI)
+library(odbc)
+library(keyring)
+library(DatabaseConnector)
+library(data.table)
+library(stringr)
+library(pandoc)
+library(jsonlite)
+library(ggplot2)
+library(scales)
+```
+
+### Save database username and password
+```{r database, warning=FALSE}
+#key_set("db_username")
+#key_set("db_password")
+```
+this only needs to be done once per workspace 
+### Setting r analysis to extractedjdbc driver file 
+
+```{r jar folder }
+Sys.setenv("DATABASECONNECTOR_JAR_FOLDER"= "D:/Users/rohanramirez.a/Documents")
+```
+## database connection details
+
+```{r connection_details}
+connectionDetails <- createConnectionDetails(
+  dbms = "redshift",
+  server = "ohdsi-lab-redshift-cluster-prod.clsyktjhufn7.us-east-1.redshift.amazonaws.com/ohdsi_lab",
+  port = 5439,
+  user = keyring::key_get("db_username"),
+  password = keyring::key_get("db_password"))
+
+```
+
+ If successful, a connection should appear in the “Connections” pane of RStudio (top right) labeled “ohdsilab”. You can click on the drop down arrow beside the connection to explore the database schemas, tables, and fields.
+
+```{r connection}
+con <-  connect(connectionDetails)
+```
+
+```{r}
+# Raw Komodo data to read
+komodo_schema <- "komodo_202610"
+
+# my personal schema WRITE TABLES HERE
+write_schema <- "work_rohanramirez_a299"
+
+```
+
+Thoughts I see the inpatient table is already at the claim/visit level.non-inpatient is not. we need to get it down to that granularity. We will need to add in line_count column in order to capture the number of raw lines used to reconstruct the claim. Line_count for inpatient will just be 1. 
+
+### Step 0A. Counting total patients vs. patients patients with valid hospice admission
+
+```{r}
+cat("STEP 0: Counting total patients and hospice admission...\n")
+
+population_hospice_counts <- DatabaseConnector::querySql(
+  con,
+  paste0(
+"
+WITH hospice_admission_patients AS (
+
+    /* Patients with hospice admission in non-inpatient claims */
+    SELECT DISTINCT
+        patient_id
+    FROM ", komodo_schema, ".non_inpatient_events
+    WHERE patient_id IS NOT NULL
+      AND UPPER(TRIM(bill_type_code)) IN (
+            '81A','82A',
+            '812','822',
+            '811','821'
+          )
+
+    UNION
+
+    /* Patients with hospice admission in inpatient claims */
+    SELECT DISTINCT
+        patient_id
+    FROM ", komodo_schema, ".inpatient_events
+    WHERE patient_id IS NOT NULL
+      AND UPPER(TRIM(bill_type_code)) IN (
+            '81A','82A',
+            '812','822',
+            '811','821'
+          )
+)
+
+SELECT
+
+    COUNT(DISTINCT d.patient_id)
+        AS total_patients,
+
+    COUNT(
+        DISTINCT CASE
+            WHEN h.patient_id IS NOT NULL
+            THEN d.patient_id
+        END
+    ) AS patients_with_hospice_admission,
+
+    COUNT(
+        DISTINCT CASE
+            WHEN h.patient_id IS NULL
+            THEN d.patient_id
+        END
+    ) AS patients_without_hospice_admission
+
+FROM ", komodo_schema, ".patient_demographics d
+
+LEFT JOIN hospice_admission_patients h
+    ON d.patient_id = h.patient_id;
+"
+  )
+)
+names(population_hospice_counts) <-
+  tolower(names(population_hospice_counts))
+print(population_hospice_counts)
+cat("STEP 0 COMPLETE\n")
+```
+
+
+### STEP 0B Granularity Check on Non-inpatient table 
+
+this was a check to **confirm structure for non-inpatient**. This confirms that claim identity should be patient_id and utilization id as hospice information may be split across those lines.
+From examining further on the dataset to get it down to one claim-event for non-inpatient we need to consider patient_id + utilization id + service_date. 
+
+```{r}
+cat("Checking example non-inpatient utilization...\n")
+
+start_time <- Sys.time()
+
+example_utilization <- DatabaseConnector::querySql(
+  con,
+  paste0(
+"
+SELECT
+    patient_id,
+    utilization_id,
+    line_number,
+    service_date,
+    service_to_date,
+    bill_type_code,
+    revenue_code,
+    procedure_code
+
+FROM ", komodo_schema, ".non_inpatient_events
+
+WHERE patient_id = 'CEH4RGD8'
+  AND utilization_id = 'e989d64c3d8189b010661c148cc7af9c150eb9817640e29500ca09b007e0ef01'
+
+ORDER BY
+    service_date,
+    line_number;
+"
+  )
+)
+
+end_time <- Sys.time()
+
+cat(
+  "CHECK COMPLETE - elapsed time:",
+  round(
+    as.numeric(
+      difftime(end_time, start_time, units = "secs")
+    ),
+    1
+  ),
+  "seconds\n"
+)
+
+print(example_utilization)
+
+
+```
+
+
+### Step 1 Checking quality for preprocessing done on DBeaver 
+This was the process done for DBeaver tables:
+* CREATE batch_keys
+* CREATE batch_lines
+* CREATE batch_core
+* CREATE batch_events
+* Quality Check everything
+* INSERT INTO hospice_nonip_events
+* verify that year's rows are now permanent
+* DROP:
+       * batch_keys
+       * batch_lines
+       * batch_core
+       * batch_events
+* next year repeat
+Finalized rows for in-patient table:
+    patient_id,
+    utilization_id,
+    claim_source,
+    event_date,
+    event_date_source,
+    bill_type_code,
+    level_code,
+    place_code,
+    revenue_codes,
+    qualifying_revenue_codes,
+    cpt_hcpcs_codes,
+    qualifying_cpt_hcpcs_codes,
+    service_area_type,
+    primary_diagnosis_codes,
+    diagnosis_codes,
+    admit_date,
+    discharge_date,
+    claim_from_date,
+    claim_through_date,
+    service_date,
+    service_to_date,
+    line_count,
+    first_line_number,
+    last_line_number,
+    line_numbers
+I then added in a command for each table to be based on hospice admission so going off of bill types: 81A, 82A, 812, 822, 821, and 811. Finally, when merging the two tables together it was very simple and chose it to be the earliest hospice admission entry date chosen per patients (.hospice_candidates). We will create a new column that has closed T/F to determine whether a patient was closed a year back prior to admission for both RX and MX.
+                    * TRUE  = patient has continuous MX CLOSED AND RX CLOSED
+                            covering the entire 12 months before hospice entry
+                    
+                    * FALSE = one or both are not continuously closed for that full year
+After age identification for 50 and up upon hospice entrance. I made a new table for the final candidates being :
+.hospice_f_candidates.I then added in a column based on what the protocol wanted and had it be medicaid_primary if it was someone's primary insurance. for MEDICAID.
+
+### Step 2 HIV identification 
+
+To start I made two new columns for this table of .hospice_f_candidates. hiv_status being True or False (boolean) and hiv_most_recent_date this will be the most recent date of HIV being identified through prescription medication (not including lamivudine as it treats Hep B).
+
+```{r}
+# Reuse Nemo's lookup/import helpers. NOT using ohdsilab as it sucks
+source("1_configure_clinical_metrics.R")
+candidate_table <- paste0(
+  write_schema,
+  ".hospice_f_candidates"
+)
+#load nemos HIV diagnosis lookup 
+hiv_lookup <- read_lookup_csv(
+  file.path(
+    "Clinical Metric Look Up Tables",
+    "0.6_hiv_diagnosis_lookup.csv"
+  )
+)
+hiv_codes <- unique(
+  data.frame(
+    dx_code = hiv_lookup$match_value[
+      toupper(hiv_lookup$metric) == "HIV" &
+      hiv_lookup$code_system == "ICD10CM" &
+      tolower(hiv_lookup$match_type) == "exact" &
+      !is.na(hiv_lookup$match_value)
+    ],
+    stringsAsFactors = FALSE
+  )
+)
+print(hiv_codes)
+```
+Honestly tried to run the rest in rstudio but the code was too annoyingly slow so I did it in DBeaver. 
+                            RStudio
+                              read/verify Nemo HIV lookup
+                                    THEN
+                            DBeaver
+                              diagnose HIV routes
+                              pharmacy HIV route
+                              combine all 3
+                              UPDATE hospice_f_candidates
+                                      THEN
+                            RStudio
+                              query final HIV counts
+                              extend CONSORT / descriptive analysis
+A couple of points, so Route 3 also stops at hospice admission of:
+p.fill_date <= p.event_)date 
+Also, from my temporary tables in DBeavr:\
+hospice_hiv_dx_summary
+    patient_id
+    inpatient_pass
+    outpatient_hiv_dates
+    latest_inpatient_date
+    latest_outpatient_date
+hospice_hiv_rx_summary
+    patient_id
+    pharmacy_pass
+    latest_pharmacy_date
+
+We merge the tables. Route 3 is doing two jobs simultaneously:
+1. Finding new HIV-positive people who failed Routes 1 and 2.
+2. Providing a potentially more recent HIV evidence date for people who already passed Routes 1 or 2.
+
+
+My thoughts based on what the protocol said:
+I would exclude standalone lamivudine products, regardless of whether that particular formulation is commonly used for HIV or HBV. That means regular EPIVIR should also be excluded for this algorithm because its active drug is still lamivudine. FDA labeling confirms EPIVIR is lamivudine for HIV treatment, while EPIVIR-HBV is the lower-dose HBV product. I still saw epivir recommended to sever HEP B.
+
+### Pharmacy Based HIV identification - medication exclusions 
+
+Route 3 requires at least two distinct qualifying antiretroviral medication fill dates. Medications with alternative indications were excluded as independent evidence of HIV infection to reduce potential misclassification.Also it is for PAID pharmacy transactions with FINAL o STANDALONE transaction status 
+
+Excluded medications:
+
+Standalone lamivudine: LAMIVUDINE, LAMIVUDINE HBV, EPIVIR HBV.
+
+Standalone tenofovir: TENOFOVIR, TENOFOVIR ALEFENAMIDE, TENOFOVIR ALAFENAMIDE, TENOFOVIR DISOPROXIL FUMARATE, VEMLIDY, VIREAD.
+
+Standalone ritonavir: RITONAVIR, NORVIR.
+
+HIV prevention or potentially dual-use medications: APRETUDE, YEZTUGO, DESCOVY, TRUVADA, VOCABRIA, EMTRICITABINE-TENOFOVIR DISOP, EMTRICITABINE/TENOFOVIR.
+
+Retained medications:
+
+EPIVIR (HIV-1 treatment formulation, distinct from EPIVIR HBV).
+EPZICOM.
+ABACAVIR-LAMIVUDINE.
+ABACAVIR-LAMIVUDINE-ZIDOVUDINE.
+DOLUTEGRAVIR-LAMIVUDINE.
+LAMIVUDINE-ZIDOVUDINE.
+LOPINAVIR-RITONAVIR.
+Other qualifying combination HIV treatment products and there is a longer excel document. 
+
+Important distinction: These exclusions apply to pharmacy-based HIV cohort identification, not automatically to antiretroviral therapy (ART) adherence measurement. Appropriate dual-use medications and pharmacokinetic boosters may contribute to ART coverage among patients already identified as HIV-positive.
+
+
+
+What I would write in methods section of paper:
+
+Pharmacy-based HIV identification required at least two distinct pre-hospice fill dates for medications contained in the study HIV medication reference. Standalone lamivudine products were excluded because lamivudine may also be prescribed for hepatitis B; combination antiretroviral products containing lamivudine were retained
+
+
+**route 3: medication reference **
+```{r}
+library(readxl)
+
+# Read the HIV medication reference file
+hiv_drugs <- read_excel("HIVDrugAbbrev.xlsx")
+# Reduce to one row per unique medication name
+hiv_drug_lookup <- unique(
+  data.frame(
+    drug_name = toupper(trimws(hiv_drugs$DrugName)),
+    stringsAsFactors = FALSE
+  )
+)
+# Remove blanks / missing names
+hiv_drug_lookup <- hiv_drug_lookup[
+  !is.na(hiv_drug_lookup$drug_name) &
+    hiv_drug_lookup$drug_name != "",
+  ,
+  drop = FALSE
+]
+# Check the unique medication list
+print(hiv_drug_lookup)
+
+nrow(hiv_drug_lookup)
+# should be 139
+```
+
+cohort identification flag 
+```{r}
+hiv_drug_lookup$identify_hiv <- TRUE
+
+# Drugs that should NOT independently establish HIV status
+hiv_identification_exclusions <- c(
+  # Cabotegravir:
+  # APRETUDE = PrEP
+  # VOCABRIA can be treatment OR PrEP
+  # generic CABOTEGRAVIR is therefore ambiguous
+  "APRETUDE",
+  "VOCABRIA",
+  "CABOTEGRAVIR",
+  # Lamivudine / HBV ambiguity
+  "LAMIVUDINE",
+  "LAMIVUDINE HBV",
+  "EPIVIR HBV",
+  # Mentor-specified exclusions
+  "APRETUDE",
+  "YEZTUGO",
+  # Standalone tenofovir products
+  "TENOFOVIR",
+  "TENOFOVIR ALEFENAMIDE",
+  "TENOFOVIR ALAFENAMIDE",
+  "TENOFOVIR DISOPROXIL FUMARATE",
+  "VEMLIDY",
+  "VIREAD",
+  #FTC + TAF again HIV treatment or prep 
+  "DESCOVY",
+  "EMTRICITABINE-TENOFOVIR ALAFENAMIDE",
+  "EMTRICITABINE-TENOFOVIR ALEFENAMIDE",
+  #FTC + TDF can be HIV treatment or prep 
+  "TRUVADA",
+  "EMTRICITABINE-TENOFOVIR DISOPROXIL FUMARATE",
+  # Standalone ritonavir
+  "RITONAVIR",
+  "NORVIR"
+)
+# Change only those drugs to FALSE
+hiv_drug_lookup$identify_hiv[
+  hiv_drug_lookup$drug_name %in% hiv_identification_exclusions
+] <- FALSE
+#see everything excluded from route 3
+hiv_drug_lookup[
+  hiv_drug_lookup$identify_hiv == FALSE,
+  ,
+  drop = FALSE
+]
+```
+
+
+Small permanent lookup table in work schema. for bridges between rstudio and DBeaver:
+```{r}
+source("1_configure_clinical_metrics.R")
+DatabaseConnector::executeSql(
+  con,
+"
+CREATE TABLE work_rohanramirez_a299.hiv_drug_lookup (
+    drug_name VARCHAR(255),
+    identify_hiv BOOLEAN
+)
+DISTSTYLE ALL
+SORTKEY(drug_name);
+"
+)
+```
+
+Now I will match Nemo's helper by subsetting the supplied data frame using the columns argument andthen builds the insert using those columns. 
+The helper will encode my logical r values as quotes True/False text. redshift acceots values as Boolean. 
+```{r}
+source("1_configure_clinical_metrics.R")
+insert_data_frame(
+  con = con,
+  table_identifier = "work_rohanramirez_a299.hiv_drug_lookup",
+  columns = c(
+    "drug_name",
+    "identify_hiv"
+  ),
+  data = hiv_drug_lookup
+)
+
+
+```
+
+
+Now i will do a lookup check to make sure it worked.
+```{r}
+lookup_check <- DatabaseConnector::querySql(
+  con,
+"
+SELECT
+    identify_hiv,
+    COUNT(*) AS n_drugs
+FROM work_rohanramirez_a299.hiv_drug_lookup
+GROUP BY identify_hiv
+ORDER BY identify_hiv;
+"
+)
+
+names(lookup_check) <- tolower(names(lookup_check))
+print(lookup_check)
+
+```
+
+
+## CFI 
+Load Nemos 3 lookup pieces and put them into a permanent Redshift lookup tables. We then load the unifed diagnosis rules and retain the active CFI and Gagne ICD-10 rules. 
+```{r}
+source("1_configure_clinical_metrics.R")
+lookup_dir <- "Clinical Metric Look Up Tables"
+# CFI + GAGNE DIAGNOSIS LOOKUP
+diagnosis_lookup <- read.csv(
+  file.path(lookup_dir, "0.6_unified_diagnosis_rule_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+
+diagnosis_lookup$metric <- toupper(diagnosis_lookup$metric)
+diagnosis_lookup$match_type <- tolower(diagnosis_lookup$match_type)
+
+diagnosis_lookup <- diagnosis_lookup[
+  diagnosis_lookup$code_system == "ICD10CM" &
+    diagnosis_lookup$metric %in% c("CFI","GAGNE") &
+    toupper(diagnosis_lookup$final_match_after_flattening) == "TRUE",
+]
+```
+
+Now CFI procedure rules:
+```{r}
+# CFI PROCEDURE LOOKUP
+procedure_lookup <- read.csv(
+  file.path(lookup_dir, "0.6_cfi_procedure_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+procedure_lookup$metric <- toupper(procedure_lookup$metric)
+procedure_lookup$match_type <- tolower(procedure_lookup$match_type)
+procedure_lookup <- procedure_lookup[
+  procedure_lookup$metric == "CFI" &
+    procedure_lookup$code_system %in% c("CPT_HCPCS","CPTHCPCS") &
+    procedure_lookup$match_type == "range",
+]
+
+```
+
+Now the CFI weights:
+```{r}
+# CFI WEIGHTS
+cfi_weights <- read.csv(
+  file.path(lookup_dir, "0.6_cfi_weight_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+cfi_weights <- cfi_weights[
+  toupper(cfi_weights$metric) == "CFI",
+]
+cfi_weights$disease_number <- as.integer(cfi_weights$disease_number)
+cfi_weights$weight <- as.numeric(cfi_weights$weight)
+```
+
+The weight table is what nemo uses to calculate. 
+```{r}
+table(diagnosis_lookup$metric)
+table(diagnosis_lookup$match_type)
+nrow(procedure_lookup)
+nrow(cfi_weights)
+length(unique(cfi_weights$feature_id))
+
+```
+
+Now we need to make the permanent lookup tables:
+```{r}
+DatabaseConnector::executeSql(
+  con,
+"
+DROP TABLE IF EXISTS work_rohanramirez_a299.cfi_gagne_dx_lookup;
+
+CREATE TABLE work_rohanramirez_a299.cfi_gagne_dx_lookup (
+    lookup_version VARCHAR(128),
+    metric VARCHAR(16),
+    feature_id VARCHAR(128),
+    feature_name VARCHAR(256),
+    match_value VARCHAR(64),
+    range_start VARCHAR(64),
+    range_end VARCHAR(64),
+    range_end_inclusive VARCHAR(16),
+    match_type VARCHAR(16)
+)
+DISTSTYLE ALL;
+"
+)
+```
+Then we upload what we need
+```{r}
+dx_upload <- diagnosis_lookup[
+  c(
+    "lookup_version",
+    "metric",
+    "feature_id",
+    "feature_name",
+    "match_value",
+    "range_start",
+    "range_end",
+    "range_end_inclusive",
+    "match_type"
+  )
+]
+insert_data_frame(
+  con,
+  "work_rohanramirez_a299.cfi_gagne_dx_lookup",
+  names(dx_upload),
+  dx_upload
+)
+```
+
+Procedure lookup:
+```{r}
+DatabaseConnector::executeSql(
+  con,
+"
+DROP TABLE IF EXISTS work_rohanramirez_a299.cfi_procedure_lookup;
+CREATE TABLE work_rohanramirez_a299.cfi_procedure_lookup (
+    lookup_version VARCHAR(128),
+    feature_id VARCHAR(128),
+    feature_name VARCHAR(256),
+    range_start VARCHAR(64),
+    range_end VARCHAR(64),
+    match_type VARCHAR(16)
+)
+DISTSTYLE ALL;
+"
+)
+```
+```{r}
+procedure_upload <- procedure_lookup[
+  c(
+    "lookup_version",
+    "feature_id",
+    "feature_name",
+    "range_start",
+    "range_end",
+    "match_type"
+  )
+]
+
+insert_data_frame(
+  con,
+  "work_rohanramirez_a299.cfi_procedure_lookup",
+  names(procedure_upload),
+  procedure_upload
+)
+```
+
+Weights
+```{r}
+DatabaseConnector::executeSql(
+  con,
+"
+DROP TABLE IF EXISTS work_rohanramirez_a299.cfi_weight_lookup;
+
+CREATE TABLE work_rohanramirez_a299.cfi_weight_lookup (
+    lookup_version VARCHAR(128),
+    disease_number INTEGER,
+    feature_id VARCHAR(128),
+    weight DOUBLE PRECISION
+)
+DISTSTYLE ALL;
+"
+)
+```
+```{r}
+weight_upload <- cfi_weights[
+  c(
+    "lookup_version",
+    "disease_number",
+    "feature_id",
+    "weight"
+  )
+]
+weight_upload$disease_number <- as.character(weight_upload$disease_number)
+weight_upload$weight <- as.character(weight_upload$weight)
+insert_data_frame(
+  con,
+  "work_rohanramirez_a299.cfi_weight_lookup",
+  names(weight_upload),
+  weight_upload,
+  numeric_columns = c("disease_number","weight")
+)
+
+```
+Now just verify they landed
+```{r}
+DatabaseConnector::querySql(
+  con,
+"
+SELECT metric,match_type,COUNT(*) AS rules
+FROM work_rohanramirez_a299.cfi_gagne_dx_lookup
+GROUP BY metric,match_type
+ORDER BY metric,match_type;
+"
+)
+
+DatabaseConnector::querySql(
+  con,
+"
+SELECT COUNT(*) AS procedure_rules
+FROM work_rohanramirez_a299.cfi_procedure_lookup;
+"
+)
+
+DatabaseConnector::querySql(
+  con,
+"
+SELECT COUNT(*) AS weights,
+       COUNT(DISTINCT feature_id) AS features
+FROM work_rohanramirez_a299.cfi_weight_lookup;
+"
+)
+
+```
+
+
+The next importat thing to create an empty permanent CFI/Gagne evidence + CFI procedure evidence tables and fill them out by each year. Also I will be dropping people with insufficient claims window due to the normalized claims data beginning in march 31, 2015. 
+
+### Gagne lookups from Nemos code 
+
+Loading gagnes lookups 
+```{r}
+lookup_dir <- "Clinical Metric Look Up Tables"
+gagne_dx <- read.csv(
+  file.path(lookup_dir, "0.6_gagne_diagnosis_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+gagne_weights <- read.csv(
+  file.path(lookup_dir, "0.6_gagne_weight_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+```
+
+merge the feature group mapping with the weight 
+```{r}
+feature_groups <- unique(
+  gagne_dx[, c("feature_id", "gagne_group")]
+)
+groups <- unique(
+  gagne_weights[, c(
+    "lookup_version",
+    "gagne_group",
+    "gagne_group_desc",
+    "weight"
+  )]
+)
+
+gagne_lookup <- merge(
+  feature_groups,
+  groups,
+  by = "gagne_group",
+  all.x = TRUE
+)
+nrow(gagne_lookup)
+sum(is.na(gagne_lookup$weight))
+```
+
+Upload that one lookup to redshift 
+```{r}
+DatabaseConnector::executeSql(
+  con,
+"
+DROP TABLE IF EXISTS work_rohanramirez_a299.gagne_feature_group_lookup;
+
+CREATE TABLE work_rohanramirez_a299.gagne_feature_group_lookup (
+    feature_id VARCHAR(128),
+    gagne_group INTEGER,
+    lookup_version VARCHAR(128),
+    gagne_group_desc VARCHAR(256),
+    weight DOUBLE PRECISION
+)
+DISTSTYLE ALL;
+"
+)
+```
+Then....
+```{r}
+gagne_lookup$gagne_group <- as.character(gagne_lookup$gagne_group)
+gagne_lookup$weight <- as.character(gagne_lookup$weight)
+insert_data_frame(
+  con,
+  "work_rohanramirez_a299.gagne_feature_group_lookup",
+  c(
+    "feature_id",
+    "gagne_group",
+    "lookup_version",
+    "gagne_group_desc",
+    "weight"
+  ),
+  gagne_lookup,
+  numeric_columns = c("gagne_group", "weight")
+)
+
+```
+
+Everyone starts at 0 because Nemo assigns zero when no Gagne condition is observeD. I got a minimum weight of -1 and a maximum weight of 5.
+
+### CCW-30 condition count
+```{r}
+ccw_lookup_dir <- file.path(
+  "Clinical Metric Look Up Tables",
+  "CCW30"
+)
+
+ccw_lookup <- read.csv(
+  file.path(ccw_lookup_dir, "0.6_ccw30_diagnosis_lookup.csv"),
+  stringsAsFactors = FALSE
+)
+
+ccw_lookup$match_type <- tolower(ccw_lookup$match_type)
+ccw_lookup$rule_type <- tolower(ccw_lookup$rule_type)
+
+ccw_inclusions <- ccw_lookup[
+  ccw_lookup$rule_type == "inclusion",
+]
+
+table(ccw_inclusions$qualification_group)
+table(ccw_inclusions$match_type)
+
+```
+
+These are the CCW propertes that Nemo expects. Nemo’s qualification logic is: group 1 needs inpatient evidence; groups 2–3 need inpatient or $\geq $2 distinct outpatient dates; group 4 needs outpatient; groups 5–6 need any setting.
+
+First we upload only the inclusion lookup once from rstudio 
+```{r}
+ccw_upload <- ccw_inclusions[
+  c(
+    "lookup_version",
+    "condition_name",
+    "condition_name_long",
+    "ccw_condition_id",
+    "qualification_group",
+    "dx_code"
+  )
+]
+
+DatabaseConnector::executeSql(
+  con,
+"
+DROP TABLE IF EXISTS work_rohanramirez_a299.ccw30_lookup;
+
+CREATE TABLE work_rohanramirez_a299.ccw30_lookup (
+    lookup_version VARCHAR(128),
+    condition_name VARCHAR(64),
+    condition_name_long VARCHAR(256),
+    ccw_condition_id VARCHAR(128),
+    qualification_group INTEGER,
+    dx_code VARCHAR(64)
+)
+DISTSTYLE ALL
+SORTKEY(dx_code);
+"
+)
+
+ccw_upload$qualification_group <- as.character(
+  ccw_upload$qualification_group
+)
+
+insert_data_frame(
+  con,
+  "work_rohanramirez_a299.ccw30_lookup",
+  names(ccw_upload),
+  ccw_upload,
+  numeric_columns = "qualification_group"
+)
+```
+Then i verify 
+```{r}
+DatabaseConnector::querySql(
+  con,
+"
+SELECT
+    qualification_group,
+    COUNT(*) AS codes
+FROM work_rohanramirez_a299.ccw30_lookup
+GROUP BY qualification_group
+ORDER BY qualification_group;
+"
+)
+```
+
+
+What I did on R was count how many diagnosis code rows in Nemos CCW lookup belonged to each qualification group. Then I used the code rows to make sure they map into 30 CCW conditions with each condition belonging to one qualification group.
+
+So for example, group 2 having 1,914 codes does NOT mean there are 1,914 CCW conditions. It means that the conditions governed by qualification rule 2 collectively have 1,914 ICD diagnosis codes that can identify them.
+
+The qualification group tells us what evidence a a ptient needs before we count that CCW condition as present:
+* group 1 - at least 1 inpatient diagnosis 
+* group 2- at least 1 inpatient diagnosis or $\geq$ 2 distinct outpatient dates 
+* group 3- same as group 2
+* group 4- at least 1 outpatient diagnosis 
+* group 5- at least 1 diagnosis either setting 
+* group 6- at least 1 diagnosis either setting 
+
+So at the end when we see a patient with like 7 ccw condtion count it means they met the required claims based qualification criteria for 7 out of 30 CCW conditions. So they could have hundreds of claims/codes contributing to those 7 conditions 
+
+Nemo creates 2 CCW outputs while we only carried the one variable i need. His code does 3 jobs. 
+
+ccw30_conditions_long_table
+- one row per QUALIFIED patient-condition
+
+ccw30_indicators_table
+- one row per patient + 30 individual 0/1 condition flags
+   - ccw_cancer
+   - ccw_condition_count
+
+ccw30_counts_table
+- stripped-down table containing only the total condition count
+
+
+### Gagne + CFI Summary 
+```{r}
+clinical_summary <- DBI::dbGetQuery(con, "
+WITH gagne AS (
+    SELECT
+        COUNT(*) AS n_patients,
+        AVG(gagne_score) AS mean_gagne,
+        STDDEV(gagne_score) AS sd_gagne,
+        MEDIAN(gagne_score) AS median_gagne,
+        MIN(gagne_score) AS min_gagne,
+        MAX(gagne_score) AS max_gagne,
+        SUM(CASE WHEN gagne_score IS NULL THEN 1 ELSE 0 END) AS missing_gagne
+    FROM work_rohanramirez_a299.hospice_f_candidates
+),
+cfi AS (
+    SELECT
+        AVG(cfi_score) AS mean_cfi,
+        STDDEV(cfi_score) AS sd_cfi,
+        MEDIAN(cfi_score) AS median_cfi,
+        MIN(cfi_score) AS min_cfi,
+        MAX(cfi_score) AS max_cfi,
+        SUM(CASE WHEN cfi_score IS NULL THEN 1 ELSE 0 END) AS missing_cfi
+    FROM work_rohanramirez_a299.hospice_f_candidates
+)
+SELECT
+    g.n_patients,
+    g.mean_gagne,
+    g.sd_gagne,
+    g.median_gagne,
+    g.min_gagne,
+    g.max_gagne,
+    g.missing_gagne,
+    c.mean_cfi,
+    c.sd_cfi,
+    c.median_cfi,
+    c.min_cfi,
+    c.max_cfi,
+    c.missing_cfi
+FROM gagne g
+CROSS JOIN cfi c
+")
+clinical_summary
+```
+
+### Frailty level query 
+CFI $<$ 0.25   is Robust
+0.25 to $<$ 0.35 is Prefrail
+CFI $\geq$ 0.35   is Frail
+```{r}
+frailty_summary <- DBI::dbGetQuery(con, "
+    SELECT
+        frailty_level,
+        COUNT(*) AS n,
+        ROUND(
+            100.0 * COUNT(*) / SUM(COUNT(*)) OVER (),
+            2
+        ) AS pct
+    FROM work_rohanramirez_a299.hospice_f_candidates
+    GROUP BY frailty_level
+    ORDER BY n DESC
+")
+frailty_summary$frailty_label <- dplyr::recode(
+  frailty_summary$frailty_level,
+  "NONFRAIL" = "Robust",
+  "MILDLY FRAIL" = "Prefrail",
+  "MODERATELY-TO-SEVERELY FRAIL" = "Frail"
+)
+frailty_summary
+```
+
+Okay so this means nearly half of my cohort has some frailty which is wha the CFI above was hinting at. 
+
+#### Gagne distribution 
+```{r}
+gagne_distribution <- DBI::dbGetQuery(con, "
+    SELECT
+        gagne_score,
+        COUNT(*) AS n,
+        ROUND(
+            100.0 * COUNT(*) / SUM(COUNT(*)) OVER (),
+            2
+        ) AS pct
+    FROM work_rohanramirez_a299.hospice_f_candidates
+    GROUP BY gagne_score
+    ORDER BY gagne_score
+")
+gagne_distribution
+
+```
+The gagne Distribution is concentrated in the lower scores. 21.25% have a score of 0, and most patients are between 0 and 4. In fact, about 86.8% of the cohort falls between 0 and 4. It is right skewed so as the score increases the number of patients drops off quickly. Only 13.18 percent have a score of 5 or higher. Overall extreme scores are uncommon. 
+
+
+
+```{r}
+library(ggplot2)
+
+ggplot(gagne_distribution,
+       aes(x = factor(gagne_score), y = pct)) +
+  geom_col() +
+  labs(
+    x = "Gagne Comorbidity Score",
+    y = "Patients (%)"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+ggplot(frailty_summary,
+       aes(x = frailty_level, y = pct)) +
+  geom_col() +
+  labs(
+    x = NULL,
+    y = "Patients (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1)
+  )
+```
+### ART- regimen enrichment 
+Expanded component lookup — preserve one row per product/component exactly as the Excel intended.
+Regimen summary lookup — collapse only for inspection so we can see BIKTARVY → BIC, FTC, TAF be 3 components
+Then later, a patient's pharmacy fill joins to the expanded table, not the collapsed one.
+
+```{r}
+hiv_art_raw <- read_excel("HIVDrugAbbrev.xlsx")
+# Keep the Excel EXPANDED:
+# one row = one product + one component
+hiv_art_components <- hiv_art_raw %>%
+  transmute(
+    drug_name = str_squish(as.character(DrugName)),
+    drug_abrv = str_squish(as.character(DrugAbrv)),
+    cmpnt_abrv = str_squish(as.character(CmpntAbrv)),
+    drug_class = str_squish(as.character(DrugClass)),
+    delivery = str_squish(as.character(Delivery))
+  ) %>%
+  distinct()
+# now quality checking 
+nrow(hiv_art_components)
+
+n_distinct(hiv_art_components$drug_name)
+
+sum(is.na(hiv_art_components$cmpnt_abrv))
+```
+Now lets see how many components each drug/product contains:
+```{r}
+component_counts <- hiv_art_components %>%
+  group_by(drug_name) %>%
+  summarise(
+    n_components = n_distinct(cmpnt_abrv),
+    .groups = "drop"
+  )
+table(component_counts$n_components)
+```
+Now I am goingto create the redshift table 
+```{r}
+ source("1_configure_clinical_metrics.R")
+component_identifier <- qualified_identifier(
+  "work_rohanramirez_a299",
+  "hiv_art_component_lookup"
+)
+execute_sql(
+  con,
+  paste0(
+    "DROP TABLE IF EXISTS ", component_identifier, ";\n",
+    "CREATE TABLE ", component_identifier, " (\n",
+    "  drug_name VARCHAR(255),\n",
+    "  drug_abrv VARCHAR(100),\n",
+    "  cmpnt_abrv VARCHAR(50),\n",
+    "  drug_class VARCHAR(100),\n",
+    "  delivery VARCHAR(100)\n",
+    ");"
+  )
+)
+insert_data_frame(
+  con,
+  component_identifier,
+  c(
+    "drug_name",
+    "drug_abrv",
+    "cmpnt_abrv",
+    "drug_class",
+    "delivery"
+  ),
+  hiv_art_components
+)
+
+```
+
+
+Now ill do a teeny quality check
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  SELECT
+      COUNT(*) AS rows,
+      COUNT(DISTINCT drug_name) AS unique_drugs
+  FROM work_rohanramirez_a299.hiv_art_component_lookup;
+  "
+)
+
+```
+I did a check earlier and the only unmatched drug was IDVYNSO. My earlier slash/salt/abbreviation corrections successfully bridge into the Excel. The only exception is the medication I manually added after the workbook was created.I will add it now into the hiv art component lookup. My alias table explicitly maps DORAVIRINE/ISLATRAVIR to IDVYNSO. The excel contains the components as individual components. It is a two drug combination medication. I will standardize the component abreviation to ISL because the FDA uses islatravir. The excel abbreviationis also ISL. 
+
+```{r}
+DBI::dbExecute(
+  con,
+  "
+  INSERT INTO work_rohanramirez_a299.hiv_art_component_lookup
+      (drug_name, drug_abrv, cmpnt_abrv, drug_class, delivery)
+  VALUES
+  (
+      'IDVYNSO',
+      'DOR/ISL',
+      'DOR',
+      'NNRTI',
+      'TWO DRUG'
+  ),
+  (
+      'IDVYNSO',
+      'DOR/ISL',
+      'ISL',
+      'NRTI',
+      'TWO DRUG'
+  );
+  "
+)
+```
+Yes so 2 rows added as it is comprised of 2 components. 
+
+Now lets built the new ART name brifhe. this uses both the clean excel names and all the alias fixes i have made.
+
+```{r}
+DBI::dbExecute(
+  con,
+  "
+  /*DROP TABLE IF EXISTS work_rohanramirez_a299.hiv_art_name_bridge; */
+
+  CREATE TABLE work_rohanramirez_a299.hiv_art_name_bridge
+  DISTSTYLE ALL
+  SORTKEY(match_name) AS
+
+  SELECT DISTINCT
+      drug_name AS match_name,
+      drug_name AS canonical_drug_name,
+      'CANONICAL' AS mapping_source
+  FROM work_rohanramirez_a299.hiv_art_component_lookup
+
+  UNION
+
+  SELECT DISTINCT
+      a.alias_name AS match_name,
+      a.DrugName AS canonical_drug_name,
+      'EXISTING_ALIAS' AS mapping_source
+  FROM work_rohanramirez_a299.hiv_drug_alias a
+  INNER JOIN (
+      SELECT DISTINCT drug_name
+      FROM work_rohanramirez_a299.hiv_art_component_lookup
+  ) e
+      ON a.DrugName = e.drug_name
+  WHERE a.alias_name IS NOT NULL
+    AND TRIM(a.alias_name) <> '';
+  "
+)
+
+
+
+```
+Make sure one messy name does not map to multiple drugs 
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  SELECT
+      match_name,
+      COUNT(DISTINCT canonical_drug_name) AS n_drugs
+  FROM work_rohanramirez_a299.hiv_art_name_bridge
+  GROUP BY match_name
+  HAVING COUNT(DISTINCT canonical_drug_name) > 1
+  ORDER BY n_drugs DESC, match_name;
+  "
+)
+
+```
+
+
+Now I will check the actual excel components. Now inspecting the combination products 
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  SELECT
+      drug_name,
+      drug_abrv,
+      delivery,
+      COUNT(DISTINCT cmpnt_abrv) AS n_components
+  FROM work_rohanramirez_a299.hiv_art_component_lookup
+  GROUP BY
+      drug_name,
+      drug_abrv,
+      delivery
+  HAVING COUNT(DISTINCT cmpnt_abrv) >= 2
+  ORDER BY n_components, drug_name;
+  "
+)
+
+
+```
+
+this allows me to sleep at night. Now I can move onto patient pharmacy data.
+**important note**
+I am not only pulling fills whose fill date falls inside the 365 days. A 90-day prescription filled shortly before the window could still cover the beginning of the window. I want any fill whose medication supply overlaps the window. I will be using the days_supply column from pharmacy_events table.
+
+```{r}
+DBI::dbExecute(
+  con,
+  "
+  CREATE TABLE work_rohanramirez_a299.hiv_art_rx_fills_12m (
+      patient_id VARCHAR(255),
+      hospice_date DATE,
+      fill_date DATE,
+      days_supply INTEGER,
+      canonical_drug_name VARCHAR(255)
+  )
+  DISTKEY(patient_id)
+  SORTKEY(patient_id, fill_date);
+  "
+)
+```
+Now I will be doing a count on those HIV positive patients who have no matched ART fill in the 365 pre hospice window:
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+WITH no_art AS (
+    SELECT h.patient_id
+    FROM work_rohanramirez_a299.hospice_f_candidates h
+    LEFT JOIN work_rohanramirez_a299.hiv_art_rx_fills_12m a
+        ON h.patient_id = a.patient_id
+    WHERE h.hiv_status = TRUE
+      AND a.patient_id IS NULL
+)
+
+SELECT COUNT(*) AS hiv_positive_without_art_fill
+FROM no_art;
+")
+```
+Now I need to see if they had something representing like what route did they turn HIV positive on.I think it could be due to lack of valid paid pharmacy claims, lack of claims all together. 
+
+
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  WITH no_art AS (
+    SELECT
+        h.patient_id
+    FROM work_rohanramirez_a299.hospice_f_candidates h
+    LEFT JOIN work_rohanramirez_a299.hiv_art_rx_fills_12m a
+        ON h.patient_id = a.patient_id
+    WHERE h.hiv_status = TRUE
+      AND a.patient_id IS NULL
+),
+routes AS (
+    SELECT
+        n.patient_id,
+        CASE
+            WHEN COALESCE(d.inpatient_pass, 0) = 1
+             AND COALESCE(d.outpatient_hiv_dates, 0) >= 2
+             AND COALESCE(r.pharmacy_pass, 0) = 1
+                THEN 'INPATIENT + OUTPATIENT + PHARMACY'
+            WHEN COALESCE(d.inpatient_pass, 0) = 1
+             AND COALESCE(d.outpatient_hiv_dates, 0) >= 2
+                THEN 'INPATIENT + OUTPATIENT'
+            WHEN COALESCE(d.inpatient_pass, 0) = 1
+             AND COALESCE(r.pharmacy_pass, 0) = 1
+                THEN 'INPATIENT + PHARMACY'
+            WHEN COALESCE(d.outpatient_hiv_dates, 0) >= 2
+             AND COALESCE(r.pharmacy_pass, 0) = 1
+                THEN 'OUTPATIENT + PHARMACY'
+            WHEN COALESCE(d.inpatient_pass, 0) = 1
+                THEN 'INPATIENT ONLY'
+            WHEN COALESCE(d.outpatient_hiv_dates, 0) >= 2
+                THEN 'OUTPATIENT ONLY'
+            WHEN COALESCE(r.pharmacy_pass, 0) = 1
+                THEN 'PHARMACY ONLY'
+            ELSE 'NO QUALIFYING ROUTE'
+        END AS hiv_route
+
+    FROM no_art n
+    LEFT JOIN work_rohanramirez_a299.hospice_hiv_dx_summary d
+        ON n.patient_id = d.patient_id
+    LEFT JOIN work_rohanramirez_a299.hospice_hiv_rx_summary r
+        ON n.patient_id = r.patient_id
+),
+route_counts AS (
+    SELECT
+        hiv_route,
+        COUNT(*) AS patients
+    FROM routes
+    GROUP BY hiv_route
+)
+SELECT
+    hiv_route,
+    patients,
+    ROUND(
+        100.0 * patients / SUM(patients) OVER (),
+        1
+    ) AS pct_patients
+FROM route_counts
+ORDER BY patients DESC;
+  ")
+
+```
+
+only 149 patients has any qualifying hiv identification pharmacy evidence but no qualifying ART coverage. This could be due to medications only extending further than a year back as well. 
+
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  WITH no_art_pharmacy AS (
+    SELECT
+        h.patient_id,
+        h.event_date AS hospice_date,
+        r.latest_pharmacy_date
+    FROM work_rohanramirez_a299.hospice_f_candidates h
+    LEFT JOIN work_rohanramirez_a299.hiv_art_rx_fills_12m a
+        ON h.patient_id = a.patient_id
+    INNER JOIN work_rohanramirez_a299.hospice_hiv_rx_summary r
+        ON h.patient_id = r.patient_id
+    WHERE h.hiv_status = TRUE
+      AND a.patient_id IS NULL
+      AND COALESCE(r.pharmacy_pass, 0) = 1
+)
+SELECT
+    CASE
+        WHEN latest_pharmacy_date >= DATEADD(day, -365, hospice_date)
+            THEN 'WITHIN 365 DAYS'
+        WHEN latest_pharmacy_date >= DATEADD(year, -2, hospice_date)
+            THEN '1-2 YEARS BEFORE HOSPICE'
+        WHEN latest_pharmacy_date >= DATEADD(year, -3, hospice_date)
+            THEN '2-3 YEARS BEFORE HOSPICE'
+        ELSE 'MORE THAN 3 YEARS BEFORE HOSPICE'
+    END AS latest_hiv_rx_timing,
+    COUNT(*) AS patients
+FROM no_art_pharmacy
+GROUP BY 1
+ORDER BY patients DESC;
+  ")
+```
+
+Only 3 patients have passed 3 route WITHIN THE LAST YEAR WHICH IS WHAT WE NEEDED. 
+
+```{r}
+DBI::dbGetQuery(
+  con,
+  "
+  WITH suspicious AS (
+    SELECT
+        h.patient_id,
+        h.event_date AS hospice_date,
+        r.latest_pharmacy_date
+    FROM work_rohanramirez_a299.hospice_f_candidates h
+
+    LEFT JOIN work_rohanramirez_a299.hiv_art_rx_fills_12m a
+        ON h.patient_id = a.patient_id
+
+    INNER JOIN work_rohanramirez_a299.hospice_hiv_rx_summary r
+        ON h.patient_id = r.patient_id
+
+    WHERE h.hiv_status = TRUE
+      AND a.patient_id IS NULL
+      AND COALESCE(r.pharmacy_pass, 0) = 1
+
+      /* Route 3 evidence occurred during the adherence year */
+      AND r.latest_pharmacy_date >= DATEADD(day, -365, h.event_date)
+),
+
+pharmacy_names AS (
+
+    /* BRAND NAME */
+    SELECT
+        s.patient_id,
+        s.hospice_date,
+        s.latest_pharmacy_date,
+        p.fill_date::DATE AS fill_date,
+        p.days_supply,
+        p.brand_name,
+        p.generic_name,
+        'BRAND' AS name_source,
+        UPPER(TRIM(p.brand_name)) AS match_name
+
+    FROM suspicious s
+
+    INNER JOIN komodo_202610.pharmacy_events p
+        ON s.patient_id = p.patient_id
+       AND p.fill_date::DATE >= DATEADD(day, -365, s.hospice_date)
+       AND p.fill_date::DATE < s.hospice_date
+
+    WHERE p.brand_name IS NOT NULL
+
+
+    UNION ALL
+
+
+    /* GENERIC NAME */
+    SELECT
+        s.patient_id,
+        s.hospice_date,
+        s.latest_pharmacy_date,
+        p.fill_date::DATE AS fill_date,
+        p.days_supply,
+        p.brand_name,
+        p.generic_name,
+        'GENERIC' AS name_source,
+        UPPER(TRIM(p.generic_name)) AS match_name
+
+    FROM suspicious s
+
+    INNER JOIN komodo_202610.pharmacy_events p
+        ON s.patient_id = p.patient_id
+       AND p.fill_date::DATE >= DATEADD(day, -365, s.hospice_date)
+       AND p.fill_date::DATE < s.hospice_date
+
+    WHERE p.generic_name IS NOT NULL
+)
+
+SELECT
+    p.patient_id,
+    p.hospice_date,
+    p.latest_pharmacy_date,
+    p.fill_date,
+    p.days_supply,
+
+    p.brand_name,
+    p.generic_name,
+    p.name_source,
+    p.match_name,
+
+    CASE
+        WHEN r.match_name IS NOT NULL THEN 'YES'
+        ELSE 'NO'
+    END AS route3_match,
+
+    CASE
+        WHEN a.match_name IS NOT NULL THEN 'YES'
+        ELSE 'NO'
+    END AS art_bridge_match,
+
+    a.canonical_drug_name
+
+FROM pharmacy_names p
+
+LEFT JOIN (
+    SELECT DISTINCT
+        UPPER(TRIM(match_name)) AS match_name
+    FROM work_rohanramirez_a299.hiv_route3_match_names
+) r
+    ON p.match_name = r.match_name
+
+LEFT JOIN (
+    SELECT DISTINCT
+        UPPER(TRIM(match_name)) AS match_name,
+        canonical_drug_name
+    FROM work_rohanramirez_a299.hiv_art_name_bridge
+) a
+    ON p.match_name = a.match_name
+
+/* only show medication names relevant to our HIV/ART logic */
+WHERE r.match_name IS NOT NULL
+   OR a.match_name IS NOT NULL
+
+ORDER BY
+    p.patient_id,
+    p.fill_date,
+    p.name_source;
+  
+  
+  
+  ")
+
+
+```
+
+
+The answer back is the issue is the days supply is null, so PDC cannot be calculated from these claims.  I will need to ask if these will be classified as non-calculable PDC rather than nonadherent. 
+
+The remaining ART workflow is:
+1. Convert each component interval into patient-day coverage.
+2. For each patient-day, determine how many ART components are active.
+3. Determine whether that day represents adequate ART coverage, using the protocol’s 2- or 3-drug regimen logic.
+4. Count the number of adequately covered days.
+5. Calculate:
+\[
+\text{PDC}=\frac{\text{days adequately covered by ART}}{365}
+\]
+
+*PDC = 0*: The patient has qualifying ART pharmacy fills with valid dates and days supplied, but never reaches your requirement of at least 2 concurrent ART components during the 365-day window.
+
+*PDC greater than 0*: The patient has at least some days with 2 or more concurrent ART components.
+
+*PDC = NULL*: We cannot calculate PDC from qualifying ART fills. This could be because no qualifying claims were found or because relevant prescription information was missing.( like days supply)
+
+
+6. Then classify:
+   - PDC < 0.80 = nonadherent
+   - sensitivity at $<$0.85
+   - sensitivity at $<$0.95
+That mirrors Dr. Mui’s approach conceptually: PDC is based on days covered by at least two ART medications, with <80% as the primary nonadherence threshold and 85$%$/95$%$ sensitivity thresholds.
+
+
+### important art checs 
+
+```{r}
+DBI::dbGetQuery(
+  con, "
+SELECT
+    COUNT(DISTINCT canonical_drug_name) AS unique_art_products,
+    COUNT(DISTINCT cmpnt_abrv) AS unique_art_components,
+    COUNT(DISTINCT drug_class) AS unique_drug_classes,
+    COUNT(DISTINCT patient_id) AS patients_with_art
+FROM work_rohanramirez_a299.hiv_art_component_fills_12m;
+")
+```
+ART products actually observed and how common 
+```{r}
+DBI::dbGetQuery(
+  con, "
+SELECT
+    canonical_drug_name,
+    COUNT(DISTINCT patient_id) AS patients,
+    COUNT(*) AS component_fill_rows
+FROM work_rohanramirez_a299.hiv_art_component_fills_12m
+GROUP BY canonical_drug_name
+ORDER BY patients DESC;
+")
+
+```
+
+
+
+
+art_pdc = main PDC, where all CmpntAbrv components count, including boosters such as COBI/RTV.
+Overall it is a medication implementation using pdc. 
+After making my tables i got this change and it was a very small small difference 
+```{r}
+DBI::dbGetQuery(
+  con, "
+SELECT
+    'With booster' AS measure,
+    COUNT(*) AS patients,
+    MIN(art_pdc) AS min_pdc,
+    MAX(art_pdc) AS max_pdc,
+    AVG(art_pdc) AS mean_pdc,
+    MEDIAN(art_pdc) AS median_pdc,
+    STDDEV_SAMP(art_pdc) AS sd_pdc
+FROM work_rohanramirez_a299.hiv_art_pdc_summary
+ ")
+```
+
+Another count verification 
+```{r}
+DBI::dbGetQuery(
+  con,"
+SELECT
+    COUNT(*) AS total_hiv_positive,
+    COUNT(p.patient_id) AS patients_with_pdc_record,
+    SUM(
+        CASE WHEN p.patient_id IS NULL
+             THEN 1 ELSE 0 END
+    ) AS patients_without_pdc_record
+FROM work_rohanramirez_a299.hospice_f_candidates h
+LEFT JOIN work_rohanramirez_a299.hiv_art_pdc_summary p
+    ON h.patient_id = p.patient_id
+WHERE h.hiv_status = TRUE;
+")
+```
+I updated the tables now. I left it like this. 
+HIV+ + art_pdc_calculable = TRUE
+-- PDC available 
+
+HIV+ + art_pdc_calculable = FALSE
+--- PDC could not be calculated
+
+HIV−
+---ART PDC not applicable
+
+I did make boosters include in the primary table. 
+
+nonadherent_80 = 1  → nonadherent, PDC < 0.80
+nonadherent_80 = 0  → adherent, PDC ≥ 0.80
+nonadherent_80 = NULL → PDC not calculable / not applicable
+
+art_pdc
+→ continuous adherence measure
+→ e.g. 0.732 = 73.2% of days covered
+
+nonadherent_85 / nonadherent_95
+→ sensitivity definitions
+
+```{r pdc-distribution}
+pdc_data <- DBI::dbGetQuery(con, "
+    SELECT
+        patient_id,
+        art_pdc
+    FROM work_rohanramirez_a299.hiv_art_pdc_summary
+")
+ggplot(pdc_data, aes(x = art_pdc)) +
+    geom_histogram(
+        binwidth = 0.05,
+        boundary = 0
+    ) +
+    geom_vline(
+        xintercept = 0.80,
+        linetype = "dashed"
+    ) +
+    labs(
+        title = "Distribution of ART Proportion of Days Covered",
+        x = "Proportion of days covered (PDC)",
+        y = "Patients"
+    ) +
+    scale_x_continuous(
+        limits = c(0, 1),
+        breaks = seq(0, 1, 0.1)
+    ) +
+    theme_minimal(base_size = 12)
+```
+The .8 is the primary adherence cutoff. The distribution has a substantial lower tail, indicating meaningful variation in ART coverage across patients. The patients to the left of the line are classified as nonadherent. 
+
+
+### Polypharmacy 
+
+```{r}
+# Polypharmacy pharmacy claims use komodo_202610 because the original
+# komodo_202606 source schema is no longer available.
+# Cohort membership and hospice index dates remain fixed from the original
+# hospice_f_candidates cohort; pharmacy exposure remains restricted to each
+# patient's 12-month pre-hospice window. my notes due to them deleting the old one
+bundle <- file.path("polypharmacy")
+options(
+  komodo.shareable_polypharmacy.config = list(
+    study_root = getwd(),
+    # keep this consistent with the rest of our project well they deleted the older one which blows wtf
+    komodo_schema = "komodo_202610",
+    # final eligible hospice cohort
+    cohort_schema = "work_rohanramirez_a299",
+    cohort_table = "hospice_f_candidates",
+    # one index per patient
+    index_id_column = "patient_id",
+    patient_id_column = "patient_id",
+    index_date_column = "event_date",
+    write_schema = "work_rohanramirez_a299",
+    # keep the polypharmacy tables identifiable
+    table_prefix = "hospice_poly12m_",
+    # polypharmacy definition
+    lookback_months = 12L,
+    minimum_classes = 5L,
+    minimum_days = 90L,
+    # frozen mapping version for this analysis
+    mapping_version = "hospice_atcprod_20261110",
+    relation_policy = "atcprod_only",
+    #this is temporary TRUE i will change it back to false 
+    replace_existing = FALSE
+  )
+)
+source(file.path(bundle, "1_configure_polypharmacy.R"))
+cfg <- polypharmacy_config()
+cfg
+```
+
+
+Cohort sanity check 
+```{r}
+poly_cohort_check <- DBI::dbGetQuery(con, "
+    SELECT
+        COUNT(*) AS n_rows,
+        COUNT(DISTINCT patient_id) AS n_patients,
+        SUM(CASE WHEN patient_id IS NULL THEN 1 ELSE 0 END) AS missing_patient_id,
+        SUM(CASE WHEN event_date IS NULL THEN 1 ELSE 0 END) AS missing_hospice_date,
+        MIN(event_date) AS earliest_hospice,
+        MAX(event_date) AS latest_hospice
+    FROM work_rohanramirez_a299.hospice_f_candidates
+")
+poly_cohort_check
+```
+To clarify the defaults in nemos code were `12` months, `5` classes, and `90` days. Stage 2 so this does not decide where ART counts towards polypharmacy. 
+It will:
+- create each patient's 12-month pre-hospice window;
+- scan pharmacy claims;
+- keep paid terminal claims with valid NDC11 and positive `days_supply`;
+- include carry-in fills whose medication supply overlaps the beginning of the window;
+- save the cleaned pharmacy fills;
+- export the unique NDC11 codes needed for mapping.
+```{r}
+source(file.path(bundle, "2_prepare_polypharmacy_inputs.R"))
+# alright 
+```
+
+hospice_poly12m_index_windows	Permanent	Yes
+hospice_poly12m_fills	Permanent	Yes
+hospice_poly12m_pipeline_state	Permanent	Yes
+pp_rx_candidates	Temporary	No
+pp_rx_valid	Temporary	No
+
+```{r}
+cfg <- getOption("komodo.shareable_polypharmacy.config")
+
+cfg$mapping_version
+cfg$relation_policy
+cfg$replace_existing
+
+
+```
+This is so we know what to run in the terminal tab. Powershell command to use 
+
+My mapping was saved at Outputs/4_shareable_polypharmacy/mapping/hospice_atcprod_20261110/ndc11_atc4.csv
+So these are the 3 mapping files i got:
+ndc11_atc4.csv — medication-to-ATC mapping.
+manifest.json — mapping version and reproducibility information.
+rxnav_cache.sqlite — cached API responses.
+
+
+
+So in DBeaver i then ran to create apermanent ART exclusion table. This joins my saved fills to the orignal pharmacy and checks both brand and generic names. I identify ART fills using the existing name bridge which I made earlier for the pharmacy identification for HIV.It is an expensive query as we are joining it against the large pharmacy scan from earlier. 
+
+Comparing the two ART algorithms directly 
+```{r}
+DBI::dbGetQuery(
+  con,"
+WITH art AS (
+    SELECT DISTINCT patient_id
+    FROM work_rohanramirez_a299.hospice_poly12m_art_exclusions_v2
+),
+pdc AS (
+    SELECT DISTINCT patient_id
+    FROM work_rohanramirez_a299.hiv_art_pdc_summary
+)
+SELECT
+    CASE WHEN a.patient_id IS NOT NULL
+         THEN 'ART MATCH' ELSE 'NO ART MATCH' END AS ndc_status,
+    CASE WHEN p.patient_id IS NOT NULL
+         THEN 'PDC RECORD' ELSE 'NO PDC RECORD' END AS pdc_status,
+    COUNT(*) AS patients
+FROM work_rohanramirez_a299.hospice_f_candidates h
+LEFT JOIN art a ON h.patient_id = a.patient_id
+LEFT JOIN pdc p ON h.patient_id = p.patient_id
+WHERE h.hiv_status = TRUE
+GROUP BY 1, 2
+ORDER BY 1, 2;
+  ")
+
+```
+
+So this means my two art identification methods agree mostly in terms of the HIV positive patients.There is an NDC record for ART butnot for my pdc. That means one patient can have an ART-associated NDC in the polypharmacy data but still lack a qualifying PDC record.interesting no pdc 576. 
+
+
+
+```{r}
+DBI::dbGetQuery(
+  con,"
+/* find the one HIV-positive patient with an ART NDC match but NULL PDC */
+WITH art_ndc_patients AS (
+    SELECT DISTINCT
+        i.patient_id
+    FROM work_rohanramirez_a299.hospice_poly12m_art_exclusions_v2 e
+    JOIN work_rohanramirez_a299.hospice_poly12m_index_windows i
+        ON e.index_id = i.index_id
+)
+SELECT
+    h.patient_id,
+    h.event_date AS hospice_date,
+    h.art_pdc
+FROM work_rohanramirez_a299.hospice_f_candidates h
+JOIN art_ndc_patients a
+    ON h.patient_id = a.patient_id
+WHERE h.hiv_status = TRUE
+  AND h.art_pdc IS NULL;
+    ")
+```
+
+```{r}
+DBI::dbGetQuery(
+  con,"
+WITH missing_art AS (
+    SELECT p.patient_id, p.art_pdc
+    FROM work_rohanramirez_a299.hiv_art_pdc_summary p
+    LEFT JOIN (
+        SELECT DISTINCT patient_id
+        FROM work_rohanramirez_a299.hospice_poly12m_art_exclusions_v2
+    ) a ON p.patient_id = a.patient_id
+    WHERE a.patient_id IS NULL
+),
+fill_patients AS (
+    SELECT DISTINCT f.patient_id
+    FROM work_rohanramirez_a299.hospice_poly12m_fills f
+    JOIN missing_art m ON f.patient_id = m.patient_id
+),
+matching_dates AS (
+    SELECT DISTINCT r.patient_id
+    FROM work_rohanramirez_a299.hiv_art_rx_fills_12m r
+    JOIN missing_art m ON r.patient_id = m.patient_id
+    JOIN work_rohanramirez_a299.hospice_poly12m_fills f
+        ON r.patient_id = f.patient_id
+       AND r.fill_date = f.fill_date
+)
+SELECT
+    CASE
+        WHEN f.patient_id IS NULL THEN 'No pharmacy fills'
+        WHEN d.patient_id IS NOT NULL THEN 'Matching fill dates'
+        ELSE 'No matching ART dates'
+    END AS category,
+    COUNT(DISTINCT m.patient_id) AS patients,
+    COUNT(DISTINCT CASE WHEN m.art_pdc > 0
+        THEN m.patient_id END) AS positive_pdc,
+    COUNT(DISTINCT CASE WHEN m.art_pdc = 0
+        THEN m.patient_id END) AS zero_pdc
+FROM missing_art m
+LEFT JOIN fill_patients f ON m.patient_id = f.patient_id
+LEFT JOIN matching_dates d ON m.patient_id = d.patient_id
+GROUP BY 1
+ORDER BY 1;
+")
+```
+
+got back 0 rows so this is reassuring. looking at the one person
+
+
+```{r}
+DBI::dbGetQuery(
+  con,"
+/* inspect the ART exclusions for this patient */
+SELECT e.*
+FROM work_rohanramirez_a299.hospice_poly12m_art_exclusions_v2 e
+JOIN work_rohanramirez_a299.hospice_poly12m_index_windows i
+    ON e.index_id = i.index_id
+WHERE i.patient_id = 'QLYX6ZXT';
+
+")
+```
+
+The NDC is emlidy (tenofovir alafenamide), 25 mg, a medication indicated for chronic hepatitis B treatment. I got it from this link  https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid=72e6b33c-0351-4070-9172-eeaa186c01d2. All this drug is Vemlidy. Issue is we cannot  establish that Vemlidy was prescribed for HIV or that the patient wasn't receiving HIV treatment elsewhere.Their ART pdc will remain as NULL. 
+
+
+# stage 3 
+After validating the exclusions, the next task is to modify 3_build_polypharmacy_exposures.R so the exposure calculation excludes records found in hospice_poly12m_art_exclusions.I will keep the orignal ATC crosswalk and calculate :
+$$
+Non-ART \space polypharmacy  = \left\{
+\begin{aligned}
+  1, & \quad \text{if } 5+ \text{concurrent non-ART ATC3 classes for 90+ days } \\
+  0,       & \quad \text{otherwise}
+\end{aligned}
+\right.
+$$
+HIV Route 3 identification: Vemlidy remains excluded.
+ART proportion of days covered (PDC): Vemlidy remains excluded.
+Non-ART polypharmacy: Vemlidy remains eligible, provided it has a valid Anatomical Therapeutic Chemical (ATC) class mapping.
+
+now for polypharmacy exclusions:
+Medication category                                                               	Non-ART polypharmacy
+Identified HIV treatment products, such as Biktarvy and Triumeq	                         Exclude
+ART combination products, such as Descovy and Truvada	                        Exclude under the current rule
+Vemlidy                                                                                 	Include
+Other medications not matched to my ART exclusion reference	Include if they have a qualifying ATC mapping
+
+To reiterate - Vemlidy's verified National Drug Code (NDC) is 61958230101.which makes it a hep B treatment. 
+
+
+```{r}
+# Check Vemlidy in the saved ATC crosswalk
+crosswalk <- read.csv(
+  file.path(
+    "Outputs", "4_shareable_polypharmacy",
+    "mapping", "hospice_atcprod_20261110",
+    "ndc11_atc4.csv"
+  ),
+  colClasses = "character"
+)
+
+subset(
+  crosswalk,
+  ndc11 == "61958230101",
+  select = c(ndc11, atc4, mapping_status)
+)
+```
+third stage
+
+```{r}
+source(file.path(bundle, "3_build_polypharmacy_exposures.R"))
+
+
+```
+9.5 percent of pharmacy fill records are unmapped. I will be using this link where I download a json file of more ndcs to try to get these mapped- https://open.fda.gov/apis/drug/ndc/download/ 
+Made it in zip file so i can get it into environment. 
+
+
+```{r}
+
+unzip(
+  "polypharmacy/drug-ndc-0001-of-0001.zip",
+  exdir = "polypharmacy"
+)
+```
+
+I added this to a .gitignore as it is just so large. Now I will match the 200 NDCs to the FDA json file 
+
+```{r}
+unmapped <- dbGetQuery(con, "
+    SELECT priority_rank, ndc11, fill_records
+    FROM work_rohanramirez_a299.unmapped_stage3_ndcs
+    ORDER BY priority_rank
+")
+unmapped$ndc11 <- as.character(unmapped$ndc11)
+# read the FDA JSON locally
+fda <- fromJSON("polypharmacy/drug-ndc-0001-of-0001.json",simplifyVector = FALSE)
+# convert FDA package codes into NDC11
+to_ndc11 <- function(code) {
+    if (is.null(code) || length(code) == 0) return(NA_character_)
+    code <- as.character(code[1])
+    if (is.na(code)) return(NA_character_)
+    if (grepl("^[0-9]{11}$", code)) return(code)
+    p <- strsplit(code, "-", fixed = TRUE)[[1]]
+    if (length(p) != 3) return(NA_character_)
+    fmt <- paste(nchar(p), collapse = "-")
+    if (fmt == "4-4-2") return(paste0("0", p[1], p[2], p[3]))
+    if (fmt == "5-3-2") return(paste0(p[1], "0", p[2], p[3]))
+    if (fmt == "5-4-1") return(paste0(p[1], p[2], "0", p[3]))
+    if (fmt == "5-4-2") return(paste0(p, collapse = ""))
+    NA_character_
+}
+# match NDC11 to the FDA brand and generic names
+matches <- list()
+for (drug in fda$results) {
+    if (is.null(drug$packaging)) next
+    codes <- unique(vapply(drug$packaging, function(p) {
+        to_ndc11(p$package_ndc)
+    }, character(1)))
+    hits <- intersect(codes[!is.na(codes)], unmapped$ndc11)
+    if (!length(hits)) next
+    for (ndc in hits) {
+        matches[[length(matches) + 1L]] <- data.frame(
+            ndc11 = ndc,
+            brand_name = if (is.null(drug$brand_name)) NA_character_
+                         else as.character(drug$brand_name[1]),
+            generic_name = if (is.null(drug$generic_name)) NA_character_
+                           else as.character(drug$generic_name[1])
+        )
+    }
+}
+# combine FDA information with the existing table
+identified <- if (length(matches)) {
+    unique(do.call(rbind, matches))
+} else {
+    data.frame(ndc11 = character(), brand_name = character(),
+               generic_name = character())
+}
+review <- unmapped
+review$brand_name <- NA_character_
+review$generic_name <- NA_character_
+review$fda_match_status <- "NOT_FOUND"
+for (i in seq_len(nrow(review))) {
+    x <- identified[identified$ndc11 == review$ndc11[i], ]
+    if (nrow(x) == 1) {
+        review$brand_name[i] <- x$brand_name
+        review$generic_name[i] <- x$generic_name
+        review$fda_match_status[i] <- "MATCHED"
+    } else if (nrow(x) > 1) {
+        review$fda_match_status[i] <- "MULTIPLE_MATCHES"
+    }
+}
+# Validate before writing to Redshift
+stopifnot(nrow(review) == 200)
+print(table(review$fda_match_status))
+#create the new bridge table
+target <- "work_rohanramirez_a299.bridging_unmapped_ndcs"
+DatabaseConnector::executeSql(con, paste0("
+    DROP TABLE IF EXISTS ", target, ";
+    CREATE TABLE ", target, " (
+        priority_rank INTEGER,
+        ndc11 VARCHAR(11),
+        fill_records BIGINT,
+        brand_name VARCHAR(2048),
+        generic_name VARCHAR(2048),
+        fda_match_status VARCHAR(32)
+    ) DISTSTYLE ALL SORTKEY(priority_rank);
+"), progressBar = FALSE, reportOverallTime = FALSE)
+# insert the 200 matched records
+quote_sql <- function(x) {
+    if (is.na(x)) return("NULL")
+    paste0("'", gsub("'", "''", as.character(x), fixed = TRUE), "'")
+}
+for (i in seq_len(nrow(review))) {
+    values <- c(
+        as.character(review$priority_rank[i]),
+        quote_sql(review$ndc11[i]),
+        as.character(review$fill_records[i]),
+        quote_sql(review$brand_name[i]),
+        quote_sql(review$generic_name[i]),
+        quote_sql(review$fda_match_status[i])
+    )
+    sql <- paste0("INSERT INTO ", target, " VALUES (",
+                  paste(values, collapse = ", "), ");")
+    DatabaseConnector::executeSql(con, sql,
+        progressBar = FALSE, reportOverallTime = FALSE)
+}
+rm(fda)
+gc()
+cat("Bridge created with", nrow(review), "NDCs\n")
+```
+
+actually i tried to use the nih database but my account got denied. in the future i would recommend in limitations the access to this data https://www.nlm.nih.gov/research/umls/rxnorm/docs/rxnormfiles.html?_gl=1*16o3gjv*_ga*MTAxMjM4MjU5My4xNzg4MzYzODQ3*_ga_7147EPK006*czE3OTUzOTE5NzQkbzMkZzEkdDE3OTUzOTIwMTMkajIxJGwwJGgw*_ga_P1FPTH9PL4*czE3OTUzOTE5NzQkbzMkZzEkdDE3OTUzOTIwMTMkajIxJGwwJGgw
+
+I made a supplemental mapping 
+```{r}
+DBI::dbGetQuery(
+  con,"
+SELECT
+    verification_status,
+    COUNT(*) AS ndcs,
+    SUM(fill_records) AS fill_records
+FROM work_rohanramirez_a299.supplemental_ndc_atc
+GROUP BY verification_status;
+")
+```
+
+ i rerun the mappign after discovering the 14 
+ 
+```{r}
+opts <- getOption("komodo.shareable_polypharmacy.config")
+opts$mapping_version <- "hospice_atcprod_20261110"
+opts$replace_existing <- TRUE
+options(komodo.shareable_polypharmacy.config = opts)
+source("polypharmacy/3_build_polypharmacy_exposures.R")
+```
+bruh only improved it 91.3 percent haha.recovered 434,450 additional pharmacy fills.
+
+now lets run stage 4. also had to change rcode fr 1.  
+
+```{r}
+opts <- getOption("komodo.shareable_polypharmacy.config")
+opts$mapping_version <- "hospice_atcprod_20261110_supp14"
+opts$replace_existing <- TRUE
+options(komodo.shareable_polypharmacy.config = opts)
+source("polypharmacy/4_calculate_and_validate_polypharmacy.R")
+```
+
+### Data Exploration 
+Trying to make an age positive age distribution
+hiv positive and hiv - strate bar chaty 
+and count table by age stratum and hiv status 
+
+
+```{r}
+# Pull only what I need
+age_hiv <- dbGetQuery(
+  con,
+  "
+  SELECT
+      patient_id,
+      age_at_hospice,
+      hiv_status
+  FROM work_rohanramirez_a299.hospice_f_candidates
+  WHERE age_at_hospice IS NOT NULL
+  "
+)
+
+# Create labels + age strata
+age_hiv <- age_hiv %>%
+  mutate(
+    hiv_group = ifelse(hiv_status == TRUE, "HIV positive", "HIV negative"),
+
+    age_strata = cut(
+      age_at_hospice,
+      breaks = c(50, 60, 70, 80, 90, Inf),
+      right = FALSE,
+      labels = c("50-59", "60-69", "70-79", "80-89", "90+")
+    )
+  )
+
+```
+
+Now hiv positive doign a histogram 
+```{r, warning= False}
+age_hiv %>%
+  filter(hiv_status == TRUE) %>%
+  ggplot(aes(x = age_at_hospice)) +
+  geom_histogram(
+    binwidth = 5,
+    boundary = 50,
+    color = "white"
+  ) +
+  labs(
+    title = "Age Distribution Among HIV-Positive Hospice Patients",
+    x = "Age at Hospice Admission",
+    y = "Number of Patients"
+  ) +
+  theme_minimal(base_family = "Arial")
+
+
+```
+Age strata count table 
+
+```{r}
+age_counts <- age_hiv %>%
+  count(age_strata, hiv_group) %>%
+  pivot_wider(
+    names_from = hiv_group,
+    values_from = n,
+    values_fill = 0
+  )
+
+age_counts
+
+```
+
+```{r}
+# Pull ART coverage results for HIV-positive hospice patients
+art_data <- DBI::dbGetQuery(con, "
+  SELECT
+      h.art_pdc::DOUBLE PRECISION AS art_pdc,
+      h.art_pdc_calculable,
+      h.nonadherent_80,
+      h.nonadherent_85,
+      h.nonadherent_95,
+      p.days_covered_2plus
+  FROM work_rohanramirez_a299.hospice_f_candidates h
+  LEFT JOIN work_rohanramirez_a299.hiv_art_pdc_summary p
+      ON h.patient_id = p.patient_id
+  WHERE h.hiv_status = TRUE
+")
+
+# Keep only patients with calculable ART PDC
+art_plot <- art_data %>%
+  filter(art_pdc_calculable == TRUE, !is.na(art_pdc)) %>%
+  mutate(
+    pdc_percent = 100 * art_pdc,
+    pdc_hist = pmin(pdc_percent, 99.999),
+    coverage_group = ifelse(art_pdc < 0.80,
+                            "Below 80%", "80% or above")
+  )
+
+
+# Descriptive statistics for the figure
+art_stats <- art_plot %>%
+  summarise(
+    n = n(),
+    mean_pdc = mean(art_pdc),
+    sd_pdc = sd(art_pdc),
+    median_pdc = median(art_pdc),
+    q1 = quantile(art_pdc, 0.25),
+    q3 = quantile(art_pdc, 0.75),
+    mean_covered_days = mean(days_covered_2plus, na.rm = TRUE),
+    sd_covered_days = sd(days_covered_2plus, na.rm = TRUE),
+    median_covered_days = median(days_covered_2plus, na.rm = TRUE),
+    n_below_80 = sum(art_pdc < 0.80),
+    pct_below_80 = 100 * mean(art_pdc < 0.80)
+  )
+
+
+print(art_stats)
+# Check how many HIV-positive patients lack calculable PDC
+cat("Total HIV-positive:", nrow(art_data), "\n")
+cat("PDC calculable:", nrow(art_plot), "\n")
+cat("PDC not calculable:", nrow(art_data) - nrow(art_plot), "\n")
+
+
+
+```
+
+
+
+polished boxplot 
+```{r}
+# ART coverage boxplot
+bx <- boxplot.stats(art_plot$pdc_percent)
+lower <- bx$stats[1]
+upper <- bx$stats[5]
+mean_val <- 100 * art_stats$mean_pdc
+median_val <- 100 * art_stats$median_pdc
+
+p_box <- ggplot(art_plot, aes(x = pdc_percent, y = 1)) +
+  geom_boxplot(
+    aes(group = 1),
+    orientation = "y",
+    fill = "#80B8B4",
+    color = "#17324D",
+    width = 0.22,
+    outlier.color = "#8E44AD",
+    outlier.size = 2.5
+  ) +
+  # Aimee: draw the adherence line over the boxplot
+  geom_vline(
+    xintercept = 80, linetype = "dashed",
+    color = "#C65B53", linewidth = 0.9
+  ) +
+  # Pink median line
+  annotate("segment", x = median_val, xend = median_val,
+           y = 0.89, yend = 1.11,
+           color = "#D85798", linewidth = 1.8) +
+  # Yellow mean line
+  annotate("segment", x = mean_val, xend = mean_val,
+           y = 0.87, yend = 1.13,
+           color = "#E5A900", linewidth = 1.8) +
+  # Whisker endpoints
+  annotate("segment", x = c(lower, upper), xend = c(lower, upper),
+           y = 0.92, yend = 1.08,
+           color = "#17324D", linewidth = 0.9) +
+  # Statistical labels
+  annotate("text", x = lower, y = 1.36,
+           label = paste0("Lower whisker: ", round(lower, 1), "%"),
+           hjust = 0, size = 3.5, color = "#555555") +
+  annotate("text", x = 100 * art_stats$q1, y = 1.25,
+           label = paste0("Q1: ", round(100 * art_stats$q1, 1), "%"),
+           size = 4, fontface = "bold", color = "#17324D") +
+  annotate("text", x = median_val + 5, y = 0.81,
+           label = paste0("Median: ", round(median_val, 1), "%"),
+           size = 4, fontface = "bold", color = "#D85798") +
+  annotate("text", x = 100 * art_stats$q3, y = 1.25,
+           label = paste0("Q3: ", round(100 * art_stats$q3, 1), "%"),
+           size = 4, fontface = "bold", color = "#17324D") +
+  annotate("text", x = mean_val, y = 0.68,
+           label = paste0("Mean: ", round(mean_val, 1), "%"),
+           size = 4, fontface = "bold", color = "#B8860B") +
+
+  # Legend: dashed adherence threshold
+  geom_segment(
+    data = data.frame(x = -10, xend = -5, y = 1, yend = 1),
+    aes(x = x, xend = xend, y = y, yend = yend,
+        linetype = "80% adherence threshold"),
+    inherit.aes = FALSE,
+    color = "#C65B53",
+    linewidth = 1,
+    key_glyph = "path"
+  ) +
+  # Legend: purple outliers
+  geom_point(
+    data = data.frame(x = -10, y = 1),
+    aes(x = x, y = y, shape = "Outliers"),
+    inherit.aes = FALSE,
+    color = "#8E44AD",
+    size = 3,
+    key_glyph = "point"
+  ) +
+  scale_linetype_manual(
+    values = c("80% adherence threshold" = "dashed")
+  ) +
+  scale_shape_manual(
+    values = c("Outliers" = 16)
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 100, 10),
+    labels = function(x) paste0(x, "%")
+  ) +
+  coord_cartesian(xlim = c(0, 102), ylim = c(0.57, 1.6)) +
+  scale_y_continuous(breaks = NULL) +
+  labs(
+    title = "ART Coverage Before Hospice Admission",
+    subtitle = paste0("HIV-positive patients with calculable PDC (n = ",
+                      format(art_stats$n, big.mark = ","), ")"),
+    x = "Proportion of Days Covered (PDC)",
+    y = NULL,
+    linetype = NULL,
+    shape = NULL
+  ) +
+  guides(
+    linetype = guide_legend(order = 1),
+    shape = guide_legend(order = 2)
+  ) +
+  theme_minimal(base_size = 13, base_family = "sans") +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, color = "#17324D"),
+    plot.subtitle = element_text(size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.background = element_rect(fill = "white", color = "#DDDDDD"),
+    legend.key = element_blank()
+  )
+
+p_box
+
+
+
+```
+
+
+
+
+
+
+
+
+
+

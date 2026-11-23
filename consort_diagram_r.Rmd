@@ -1,0 +1,125 @@
+---
+title: "Consort_diagram"
+author: "aimee rohan"
+date: "2026-10-14"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(consort)
+library(grid)
+set_consort_defaults(txt_gp = gpar(cex = 0.8), parse_markup = TRUE)
+```
+Goal of this is to build a consort diagram using rstudio as I did not want to go through the trouble of drawing it by hand. 
+```{r, fig.width=12, fig.height=15}
+# Cohort selection and final HIV classification
+pretty_pic <-
+  add_box(
+    txt = "**Total Patients** (n=116,049,829)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "*Patients without hospice admission* (n=114,073,843)",
+    text_width = 45
+  ) |>
+
+  add_box(
+    txt = "*Patients with hospice admission* (n=1,975,986)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "Excluded^{1} (n=7):\n• Missing hospice admission date",
+    text_width = 38
+  ) |>
+
+  add_box(
+    txt = "*Patients with identifiable hospice admission date* (n=1,975,979)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "Excluded^{2} (n=959,343):\n• Did not have 12 months of continuous MX CLOSED and RX CLOSED coverage before hospice admission",
+    text_width = 38
+  ) |>
+
+  add_box(
+    txt = "*Patients with 12 months of continuous MX and RX CLOSED coverage* (n=1,016,636)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "Excluded^{3} (n=73,160):\n• Insurance coverage gaps or changes in MX/RX insurance groups during the 12 months before hospice admission",
+    text_width = 38
+  ) |>
+
+  add_box(
+    txt = "*Patients with constant MX and RX insurance groups during the 12 months before hospice admission* (n=943,476)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "Excluded^{4} (n=28,006):\n• Younger than 50 years at hospice admission",
+    text_width = 38
+  ) |>
+
+  add_box(
+    txt = "*Patients aged 50 years or older at hospice admission* (n=915,470)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "Excluded (n=6,088):\n• Incomplete 12-month pre-hospice diagnosis/procedure claims availability",
+    text_width = 45
+  ) |>
+
+  add_box(
+    txt = "*Patients with complete 12-month claims availability* (n=909,382)",
+    text_width = 45
+  ) |>
+
+  add_side_box(
+    txt = "*Excluded: missing or unknown required demographic/geographic information* (n=37,758)"
+,
+    text_width = 45
+  ) |>
+
+  add_box(
+    txt = "**Final Eligible Hospice Cohort** (n=871,624)",
+    text_width = 45
+  ) |>
+
+  # Aimee: final cohort split by HIV classification
+  add_split(
+    txt = c(
+      "*HIV-Positive Hospice Patients* (n=2,364)",
+      "*HIV-Algorithm-Negative Hospice Patients* (n=869,260)"
+    ),
+    text_width = 45
+  )
+
+plot(pretty_pic)
+```
+
+
+
+
+```{r}
+
+# Save CONSORT diagram
+png("images/consort_hiv_hospice.png",
+    width = 3000, height = 2200, res = 300)
+
+plot(pretty_pic)
+
+dev.off()
+
+```
+
+
+

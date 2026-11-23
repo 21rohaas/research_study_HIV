@@ -1,0 +1,13 @@
+drug-ndc-0001-of-0001.json
+# SQL error reports
+errorReportSql.txt
+errorReport*.txt
+.Rhistory
+.RData
+.Rproj.user/
+# Research outputs and mapping files
+Outputs
+images 
+# Large FDA reference files
+polypharmacy/drug-ndc-0001-of-0001.json
+polypharmacy/drug-ndc-0001-of-0001.zip
